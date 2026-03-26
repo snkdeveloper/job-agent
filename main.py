@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import traceback
 from pathlib import Path
 from typing import List, Tuple
@@ -11,21 +12,34 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 from careershift_scraper import find_email
 from config import (
+    ALUMNI_OUTPUT_EXCEL,
+    ENABLE_ENGINEERING_MANAGER_FLOW,
+    ENABLE_NORTHEASTERN_ALUMNI_FLOW,
+    ENABLE_TECHNICAL_RECRUITER_FLOW,
     INPUT_EXCEL,
-    LINKEDIN_CONNECTION_NOTE,
+    NORTHEASTERN_SCHOOL_NAME,
     OUTPUT_EXCEL,
     REMOTE_DEBUGGING_ADDRESS,
     REMOTE_DEBUGGING_PORT,
-    SEND_LINKEDIN_CONNECTION_REQUESTS,
+    SAVE_NORTHEASTERN_ALUMNI_RESULTS,
+    SEARCH_EMAIL_IN_NORTHEASTERN_ALUMNI_FLOW,
+    TECHNICAL_RECRUITER_OUTPUT_EXCEL,
     random_delay,
 )
 from excel_handler import (
+    get_processed_alumni_company_location_pairs,
     get_processed_company_location_pairs,
+    get_processed_technical_recruiter_company_location_pairs,
     load_companies,
+    save_alumni_results,
     save_results,
+    save_technical_recruiter_results,
 )
-from linkedin_connector import connect_if_not_pending
-from linkedin_scraper import search_engineering_managers
+from linkedin_scraper import (
+    search_engineering_managers,
+    search_neu_alumni_by_company,
+    search_technical_recruiters,
+)
 
 
 def _ensure_site_tab(
@@ -34,14 +48,7 @@ def _ensure_site_tab(
     domain: str,
     landing_url: str,
 ) -> None:
-    """Ensure a dedicated tab exists for a given site and switch to it.
-
-    We attach to an existing Chrome profile via remote debugging, so there may
-    already be tabs open. This function:
-      1) Reuses a previously remembered handle if still valid.
-      2) Otherwise searches existing tabs for one whose URL contains `domain`.
-      3) Otherwise opens a new tab and navigates to `landing_url`.
-    """
+    """Ensure a dedicated tab exists for a given site and switch to it."""
 
     handles = list(driver.window_handles)
     remembered = getattr(driver, attr_name, None)
@@ -76,7 +83,6 @@ def _ensure_site_tab(
         driver.switch_to.new_window("tab")
     except Exception:
         driver.execute_script("window.open('about:blank','_blank');")
-        # Most browsers append the new handle at the end.
         driver.switch_to.window(driver.window_handles[-1])
 
     setattr(driver, attr_name, driver.current_window_handle)
@@ -87,13 +93,8 @@ def _ensure_site_tab(
 
 
 def _init_driver() -> webdriver.Chrome:
-    """
-    Attach to an existing Chrome session that was started with:
+    """Attach to an existing Chrome session started with remote debugging."""
 
-        chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-profile
-
-    and where the user has already logged into LinkedIn and CareerShift.
-    """
     chrome_options = Options()
     debugger_address = f"{REMOTE_DEBUGGING_ADDRESS}:{REMOTE_DEBUGGING_PORT}"
     chrome_options.add_experimental_option("debuggerAddress", debugger_address)
@@ -107,118 +108,195 @@ def _init_driver() -> webdriver.Chrome:
     return driver
 
 
-def process_company(
-    driver: webdriver.Chrome, company: str, location: str
+def _process_company(
+    driver: webdriver.Chrome,
+    company: str,
+    location: str,
+    *,
+    run_engineering_manager_flow: bool,
+    run_northeastern_alumni_flow: bool,
+    run_technical_recruiter_flow: bool,
 ) -> List[Tuple[str, str, str, str, str]]:
-    """
-    Process a single company/location:
-      - Search LinkedIn for engineering managers
-      - For each name, search CareerShift for an email
-      - Return a list of rows for Excel output
-    """
     print(f"\n=== Processing company: {company} | Location: {location} ===")
 
     rows: List[Tuple[str, str, str, str, str]] = []
 
-    try:
-        _ensure_site_tab(
-            driver,
-            attr_name="_linkedin_tab_handle",
-            domain="linkedin.com",
-            landing_url="https://www.linkedin.com/feed/",
-        )
-        candidates = search_engineering_managers(driver, company, location)
-    except Exception:
-        print(
-            f"[Error] Failed to search LinkedIn for {company} in {location}.\n{traceback.format_exc()}"
-        )
-        candidates = []
+    def _process_candidates(
+        *,
+        candidates: List[Tuple[str, str, str]],
+        flow_name: str,
+        lookup_email: bool = True,
+        save_enabled: bool = True,
+        output_path: str,
+        save_row,
+    ) -> None:
+        if not candidates:
+            print(f"[Info] No LinkedIn {flow_name} found for {company} in {location}.")
+            if save_enabled:
+                placeholder = (company, location, "", "", "NOT_FOUND")
+                save_row(rows=[placeholder])
+                print(f"[Saved] {company} | {location} | NOT_FOUND -> {output_path}")
+                rows.append(placeholder)
+            return
 
-    if not candidates:
-        print(
-            f"[Info] No LinkedIn engineering managers found for {company} in {location}."
-        )
-        # Still write a placeholder row so we know the company was processed
-        rows.append((company, location, "", "", "NOT_FOUND"))
-        return rows
+        saved_any_row = False
 
-    for idx, (first_name, last_name, profile_url) in enumerate(candidates, start=1):
-        if SEND_LINKEDIN_CONNECTION_REQUESTS:
-            print(
-                f"[LinkedIn] ({idx}/{len(candidates)}) Connect attempt: {first_name} {last_name} -> {profile_url}"
-            )
-            try:
-                _ensure_site_tab(
-                    driver,
-                    attr_name="_linkedin_tab_handle",
-                    domain="linkedin.com",
-                    landing_url="https://www.linkedin.com/feed/",
+        for idx, (first_name, last_name, _) in enumerate(candidates, start=1):
+            if lookup_email:
+                print(
+                    f"[Info] ({idx}/{len(candidates)}) Looking up email for {first_name} {last_name} at {company}..."
                 )
-                outcome = connect_if_not_pending(
-                    driver, profile_url, note=LINKEDIN_CONNECTION_NOTE
-                )
-                print(f"[LinkedIn] {outcome.result}: {outcome.detail}")
-            except Exception as exc:
-                print(f"[LinkedIn] ERROR: connect attempt failed: {exc}")
-            random_delay("After LinkedIn connect attempt")
+                random_delay("Before CareerShift search")
+                try:
+                    _ensure_site_tab(
+                        driver,
+                        attr_name="_careershift_tab_handle",
+                        domain="careershift.com",
+                        landing_url="https://careershift.com/App/Contacts/Search",
+                    )
+                    email = find_email(first_name, last_name, company, driver)
+                except Exception:
+                    print(
+                        f"[Error] Failed to search CareerShift for {first_name} {last_name} at {company}.\n{traceback.format_exc()}"
+                    )
+                    email = "NOT_FOUND"
 
-        print(
-            f"[Info] ({idx}/{len(candidates)}) Looking up email for {first_name} {last_name} at {company}..."
-        )
-        random_delay("Before CareerShift search")
+                email_str = str(email or "").strip()
+                email_upper = email_str.upper()
+                has_email = (
+                    bool(email_str)
+                    and email_upper not in {"NOT_FOUND", "NOT FOUND", "NONE", "N/A"}
+                    and ("@" in email_str)
+                )
+
+                if not has_email:
+                    print(
+                        f"[Info] Skipping save: no email found for {first_name} {last_name} at {company}."
+                    )
+                    continue
+            else:
+                print(
+                    f"[Info] ({idx}/{len(candidates)}) Skipping email lookup for {first_name} {last_name} — flow='{flow_name}'."
+                )
+                email_str = "EMAIL_LOOKUP_SKIPPED"
+
+            if save_enabled:
+                saved_any_row = True
+                row = (company, location, first_name, last_name, email_str)
+                rows.append(row)
+                save_row(rows=[row])
+                print(
+                    f"[Saved] {company} | {location} | {first_name} {last_name} | {email_str} -> {output_path}"
+                )
+                random_delay("After saving result")
+
+        if save_enabled and candidates and not saved_any_row:
+            placeholder = (company, location, "", "", "NO_RESULTS_SAVED")
+            save_row(rows=[placeholder])
+            print(f"[Saved] {company} | {location} | NO_RESULTS_SAVED -> {output_path}")
+            rows.append(placeholder)
+
+    if run_engineering_manager_flow:
         try:
             _ensure_site_tab(
                 driver,
-                attr_name="_careershift_tab_handle",
-                domain="careershift.com",
-                landing_url="https://careershift.com/App/Contacts/Search",
+                attr_name="_linkedin_tab_handle",
+                domain="linkedin.com",
+                landing_url="https://www.linkedin.com/feed/",
             )
-            email = find_email(first_name, last_name, company, driver)
+            mgr_candidates = search_engineering_managers(driver, company, location)
         except Exception:
             print(
-                f"[Error] Failed to search CareerShift for {first_name} {last_name} at {company}.\n{traceback.format_exc()}"
+                f"[Error] Failed to search LinkedIn for engineering managers at {company} in {location}.\n{traceback.format_exc()}"
             )
-            email = "NOT_FOUND"
+            mgr_candidates = []
 
-        email_str = str(email or "").strip()
-        email_upper = email_str.upper()
-        has_email = (
-            bool(email_str)
-            and email_upper not in {"NOT_FOUND", "NOT FOUND", "NONE", "N/A"}
-            and ("@" in email_str)
+        _process_candidates(
+            candidates=mgr_candidates,
+            flow_name="engineering manager candidates",
+            lookup_email=True,
+            save_enabled=True,
+            output_path=OUTPUT_EXCEL,
+            save_row=save_results,
         )
 
-        if not has_email:
+    if run_northeastern_alumni_flow:
+        try:
+            _ensure_site_tab(
+                driver,
+                attr_name="_linkedin_tab_handle",
+                domain="linkedin.com",
+                landing_url="https://www.linkedin.com/feed/",
+            )
+            alumni_candidates = search_neu_alumni_by_company(driver, company=company)
+        except Exception:
             print(
-                f"[Info] Skipping save: no email found for {first_name} {last_name} at {company}."
+                f"[Error] Failed to search LinkedIn alumni (school={NORTHEASTERN_SCHOOL_NAME}) for {company} in {location}.\n{traceback.format_exc()}"
             )
-            continue
+            alumni_candidates = []
 
-        rows.append((company, location, first_name, last_name, email_str))
-
-        # Save after each FOUND email to support resuming
-        save_results(rows=[rows[-1]])
-        print(
-            f"[Saved] {company} | {location} | {first_name} {last_name} | {email_str} -> {OUTPUT_EXCEL}"
+        _process_candidates(
+            candidates=alumni_candidates,
+            flow_name=f"alumni candidates (school={NORTHEASTERN_SCHOOL_NAME})",
+            lookup_email=bool(SEARCH_EMAIL_IN_NORTHEASTERN_ALUMNI_FLOW),
+            save_enabled=bool(SAVE_NORTHEASTERN_ALUMNI_RESULTS),
+            output_path=ALUMNI_OUTPUT_EXCEL,
+            save_row=save_alumni_results,
         )
 
-        random_delay("After saving result")
+    if run_technical_recruiter_flow:
+        try:
+            _ensure_site_tab(
+                driver,
+                attr_name="_linkedin_tab_handle",
+                domain="linkedin.com",
+                landing_url="https://www.linkedin.com/feed/",
+            )
+            recruiter_candidates = search_technical_recruiters(driver, company, location)
+        except Exception:
+            print(
+                f"[Error] Failed to search LinkedIn for technical recruiters at {company} in {location}.\n{traceback.format_exc()}"
+            )
+            recruiter_candidates = []
 
-    # If we processed candidates but found zero emails, write a single placeholder row
-    # so the run can be resumed without reprocessing this company/location.
-    if candidates and not rows:
-        placeholder = (company, location, "", "", "NO_EMAILS_FOUND")
-        save_results(rows=[placeholder])
-        print(f"[Saved] {company} | {location} | NO_EMAILS_FOUND -> {OUTPUT_EXCEL}")
-        rows.append(placeholder)
+        _process_candidates(
+            candidates=recruiter_candidates,
+            flow_name="technical recruiter candidates",
+            lookup_email=True,
+            save_enabled=True,
+            output_path=TECHNICAL_RECRUITER_OUTPUT_EXCEL,
+            save_row=save_technical_recruiter_results,
+        )
 
     return rows
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+
     print("=== LinkedIn → CareerShift Email Finder Automation ===")
     print(f"Input Excel: {INPUT_EXCEL}")
-    print(f"Output Excel: {OUTPUT_EXCEL}")
+
+    if ENABLE_ENGINEERING_MANAGER_FLOW:
+        print(f"Output Excel: {OUTPUT_EXCEL}")
+    else:
+        print("Output Excel: (engineering-manager flow disabled)")
+
+    if ENABLE_NORTHEASTERN_ALUMNI_FLOW:
+        if SAVE_NORTHEASTERN_ALUMNI_RESULTS:
+            print(
+                f"Alumni Flow: ENABLED (school={NORTHEASTERN_SCHOOL_NAME}) -> {ALUMNI_OUTPUT_EXCEL}"
+            )
+        else:
+            print(
+                f"Alumni Flow: ENABLED (school={NORTHEASTERN_SCHOOL_NAME}) -> (no Excel output)"
+            )
+
+    if ENABLE_TECHNICAL_RECRUITER_FLOW:
+        print(f"Recruiter Flow: ENABLED -> {TECHNICAL_RECRUITER_OUTPUT_EXCEL}")
 
     if not Path(INPUT_EXCEL).exists():
         print(
@@ -228,8 +306,24 @@ def main() -> None:
         return
 
     companies_df = load_companies()
-    processed_pairs = get_processed_company_location_pairs()
-    print(f"[Resume] Already processed {len(processed_pairs)} company/location pairs.")
+
+    processed_mgr_pairs = (
+        get_processed_company_location_pairs() if ENABLE_ENGINEERING_MANAGER_FLOW else set()
+    )
+    processed_alumni_pairs = (
+        get_processed_alumni_company_location_pairs()
+        if (ENABLE_NORTHEASTERN_ALUMNI_FLOW and SAVE_NORTHEASTERN_ALUMNI_RESULTS)
+        else set()
+    )
+    processed_recruiter_pairs = (
+        get_processed_technical_recruiter_company_location_pairs()
+        if ENABLE_TECHNICAL_RECRUITER_FLOW
+        else set()
+    )
+
+    print(
+        f"[Resume] Engineering-manager pairs: {len(processed_mgr_pairs)} | Alumni pairs: {len(processed_alumni_pairs)} | Recruiter pairs: {len(processed_recruiter_pairs)}"
+    )
 
     driver = _init_driver()
 
@@ -241,19 +335,35 @@ def main() -> None:
                 continue
 
             pair = (company, location)
-            if pair in processed_pairs:
+            skip_mgr = (not ENABLE_ENGINEERING_MANAGER_FLOW) or (pair in processed_mgr_pairs)
+            skip_alumni = (pair in processed_alumni_pairs) if ENABLE_NORTHEASTERN_ALUMNI_FLOW else True
+            skip_recruiter = (
+                (pair in processed_recruiter_pairs) if ENABLE_TECHNICAL_RECRUITER_FLOW else True
+            )
+
+            if skip_mgr and skip_alumni and skip_recruiter:
                 print(
-                    f"[Skip] Already processed {company} in {location} according to {OUTPUT_EXCEL}."
+                    f"[Skip] Already processed {company} in {location} according to enabled outputs."
                 )
                 continue
 
             try:
-                process_company(driver, company, location)
+                _process_company(
+                    driver,
+                    company,
+                    location,
+                    run_engineering_manager_flow=not skip_mgr,
+                    run_northeastern_alumni_flow=(
+                        ENABLE_NORTHEASTERN_ALUMNI_FLOW and (not skip_alumni)
+                    ),
+                    run_technical_recruiter_flow=(
+                        ENABLE_TECHNICAL_RECRUITER_FLOW and (not skip_recruiter)
+                    ),
+                )
             except Exception:
                 print(
                     f"[Error] Unexpected error while processing {company} in {location}.\n{traceback.format_exc()}"
                 )
-                # Continue with next company
                 continue
 
     finally:
@@ -263,9 +373,8 @@ def main() -> None:
         except Exception:
             pass
 
-    print("=== Done. Check results in results.xlsx ===")
+    print("=== Done. ===")
 
 
 if __name__ == "__main__":
     main()
-

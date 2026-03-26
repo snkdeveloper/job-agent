@@ -5,7 +5,12 @@ from typing import Iterable, List, Tuple
 
 import pandas as pd
 
-from config import INPUT_EXCEL, OUTPUT_EXCEL
+from config import (
+    ALUMNI_OUTPUT_EXCEL,
+    INPUT_EXCEL,
+    OUTPUT_EXCEL,
+    TECHNICAL_RECRUITER_OUTPUT_EXCEL,
+)
 
 
 def load_companies() -> pd.DataFrame:
@@ -32,21 +37,18 @@ def load_companies() -> pd.DataFrame:
     return df
 
 
-def _load_existing_results() -> pd.DataFrame:
-    path = Path(OUTPUT_EXCEL)
-    if not path.exists():
+def _load_existing_results(path: str) -> pd.DataFrame:
+    path_obj = Path(path)
+    if not path_obj.exists():
         return pd.DataFrame(
             columns=["company", "location", "first_name", "last_name", "email"]
         )
-    return pd.read_excel(path)
+    return pd.read_excel(path_obj)
 
 
-def get_processed_company_location_pairs() -> set[Tuple[str, str]]:
-    """
-    Return a set of (company, location) pairs that already have at least one result.
-    Used to support resuming the script without reprocessing completed companies.
-    """
-    df = _load_existing_results()
+def _get_processed_company_location_pairs(path: str) -> set[Tuple[str, str]]:
+    """Return a set of (company, location) pairs already present in the given results file."""
+    df = _load_existing_results(path)
     if df.empty:
         return set()
 
@@ -55,32 +57,57 @@ def get_processed_company_location_pairs() -> set[Tuple[str, str]]:
     if not {"company", "location"}.issubset(set(df.columns)):
         return set()
 
-    pairs = set()
+    pairs: set[Tuple[str, str]] = set()
     for _, row in df.iterrows():
-        company = str(row["company"]).strip()
-        location = str(row["location"]).strip()
+        company = str(row.get("company", "")).strip()
+        location = str(row.get("location", "")).strip()
         if company and location:
             pairs.add((company, location))
     return pairs
 
 
-def save_results(rows: Iterable[Tuple[str, str, str, str, str]]) -> None:
-    """
-    Append rows to OUTPUT_EXCEL.
+def get_processed_company_location_pairs() -> set[Tuple[str, str]]:
+    """Backward-compatible wrapper for the primary results file."""
+    return _get_processed_company_location_pairs(OUTPUT_EXCEL)
 
-    Each row is a tuple:
-        (company, location, first_name, last_name, email)
-    """
+
+def get_processed_alumni_company_location_pairs() -> set[Tuple[str, str]]:
+    """Resume support for the Northeastern alumni results file."""
+    return _get_processed_company_location_pairs(ALUMNI_OUTPUT_EXCEL)
+
+
+def get_processed_technical_recruiter_company_location_pairs() -> set[Tuple[str, str]]:
+    """Resume support for the technical recruiter results file."""
+    return _get_processed_company_location_pairs(TECHNICAL_RECRUITER_OUTPUT_EXCEL)
+
+
+def _save_results(path: str, rows: Iterable[Tuple[str, str, str, str, str]]) -> None:
+    """Append rows to the specified output Excel file."""
     new_df = pd.DataFrame(
         list(rows),
         columns=["company", "location", "first_name", "last_name", "email"],
     )
 
-    existing = _load_existing_results()
+    existing = _load_existing_results(path)
     if existing.empty:
         combined = new_df
     else:
         combined = pd.concat([existing, new_df], ignore_index=True)
 
-    combined.to_excel(OUTPUT_EXCEL, index=False, engine="openpyxl")
+    combined.to_excel(path, index=False, engine="openpyxl")
+
+
+def save_results(rows: Iterable[Tuple[str, str, str, str, str]]) -> None:
+    """Backward-compatible wrapper for the primary results file."""
+    _save_results(OUTPUT_EXCEL, rows)
+
+
+def save_alumni_results(rows: Iterable[Tuple[str, str, str, str, str]]) -> None:
+    """Append rows to the Northeastern alumni results file."""
+    _save_results(ALUMNI_OUTPUT_EXCEL, rows)
+
+
+def save_technical_recruiter_results(rows: Iterable[Tuple[str, str, str, str, str]]) -> None:
+    """Append rows to the technical recruiter results file."""
+    _save_results(TECHNICAL_RECRUITER_OUTPUT_EXCEL, rows)
 

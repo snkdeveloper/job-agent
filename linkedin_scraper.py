@@ -16,7 +16,12 @@ from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from config import DEBUG_LINKEDIN_DUMPS, MAX_LINKEDIN_RESULTS, random_delay
+from config import (
+    DEBUG_LINKEDIN_DUMPS,
+    MAX_LINKEDIN_RESULTS,
+    NORTHEASTERN_SCHOOL_FILTER,
+    random_delay,
+)
 
 
 def _wait(driver: WebDriver, timeout: int = 20) -> WebDriverWait:
@@ -712,6 +717,225 @@ def search_engineering_managers(
     if len(candidates) == 0:
         # Useful for diagnosing intermittent failures or UI changes.
         _dump_linkedin_debug(driver, tag=f"zero_{company}_{location}")
+
+    return candidates
+
+
+def search_technical_recruiters(
+    driver: WebDriver, company: str, location: str
+) -> List[Tuple[str, str, str]]:
+    """Search LinkedIn for 'technical recruiter' and filter by company/location."""
+
+    query = "technical recruiter"
+    query_url = (
+        "https://www.linkedin.com/search/results/people/"
+        f"?keywords={quote_plus(query)}"
+    )
+    print(f"[LinkedIn] Navigating to: {query_url}")
+    driver.get(query_url)
+
+    random_delay("Initial LinkedIn results load")
+
+    candidates: List[Tuple[str, str, str]] = []
+
+    hint = _wait_for_results_or_terminal_state(driver, timeout=35)
+    if hint == "UNKNOWN" and len(_find_result_cards(driver)) == 0:
+        print(
+            f"[LinkedIn] Timed out waiting for recruiter results for company='{company}', location='{location}'. State={hint}"
+        )
+        _dump_linkedin_debug(driver, tag=f"recruiter_timeout_{company}_{location}")
+        return candidates
+
+    if hint in {"NOT_LOGGED_IN", "BLOCKED_CHECKPOINT"}:
+        print(
+            f"[LinkedIn] Recruiter search page not usable (state={hint}). Are you logged in and not seeing a checkpoint/captcha?"
+        )
+        _dump_linkedin_debug(driver, tag=f"recruiter_blocked_{company}_{location}")
+        return candidates
+
+    print("[LinkedIn] Attempting to click filter label: Locations")
+    clicked_locations = _click_linkedin_filter_label(driver, label_text="Locations", timeout=10)
+    print(f"[LinkedIn] Clicked Locations label: {clicked_locations}")
+
+    if clicked_locations:
+        applied = _apply_linkedin_locations_filter(driver, location=location, timeout=20)
+        print(f"[LinkedIn] Applied location filter '{location}': {applied}")
+        if applied:
+            random_delay("After LinkedIn location filter")
+            hint = _wait_for_results_or_terminal_state(driver, timeout=35)
+
+    print("[LinkedIn] Attempting to click filter label: Current companies")
+    clicked_current_companies = _click_linkedin_filter_label(
+        driver, label_text="Current companies", timeout=10
+    )
+    print(f"[LinkedIn] Clicked Current companies label: {clicked_current_companies}")
+
+    if clicked_current_companies:
+        applied_company = _apply_linkedin_current_companies_filter(
+            driver, company=company, timeout=20
+        )
+        print(f"[LinkedIn] Applied current company filter '{company}': {applied_company}")
+        if applied_company:
+            random_delay("After LinkedIn current company filter")
+            hint = _wait_for_results_or_terminal_state(driver, timeout=35)
+
+    listitems = _find_result_cards(driver)
+    if not listitems:
+        print(
+            f"[LinkedIn] No recruiter result cards detected for company='{company}', location='{location}'. State={hint}"
+        )
+        _dump_linkedin_debug(driver, tag=f"recruiter_no_cards_{company}_{location}")
+        return candidates
+
+    seen_profile_urls: set[str] = set()
+    for item in listitems:
+        if len(candidates) >= MAX_LINKEDIN_RESULTS:
+            break
+
+        try:
+            full_name = _extract_full_name(item)
+        except StaleElementReferenceException:
+            continue
+        except Exception:
+            full_name = ""
+
+        if not full_name or "LinkedIn Member" in full_name:
+            continue
+
+        try:
+            profile_url = _extract_profile_url(item)
+        except StaleElementReferenceException:
+            continue
+        except Exception:
+            profile_url = ""
+
+        if not profile_url:
+            continue
+        if profile_url in seen_profile_urls:
+            continue
+
+        first, last = _parse_name(full_name)
+        if not first:
+            continue
+
+        candidates.append((first, last, profile_url))
+        seen_profile_urls.add(profile_url)
+
+    print(
+        f"[LinkedIn] Found {len(candidates)} technical recruiter candidates for {company} in {location}."
+    )
+
+    if len(candidates) == 0:
+        _dump_linkedin_debug(driver, tag=f"recruiter_zero_{company}_{location}")
+
+    return candidates
+
+
+def search_neu_alumni_by_company(
+    driver: WebDriver, *, company: str, location: str | None = None
+) -> List[Tuple[str, str, str]]:
+    """Search LinkedIn People for Northeastern University alumni working at a company.
+
+    Applies NEU via URL param: schoolFilter={NORTHEASTERN_SCHOOL_FILTER}
+    and then applies the Current companies (and optionally Locations) UI filters.
+    """
+
+    query_url = (
+        "https://www.linkedin.com/search/results/people/"
+        f"?keywords=&schoolFilter={NORTHEASTERN_SCHOOL_FILTER}"
+    )
+    print(f"[LinkedIn] Navigating to: {query_url}")
+    driver.get(query_url)
+
+    random_delay("Initial LinkedIn NEU alumni results load")
+
+    candidates: List[Tuple[str, str, str]] = []
+
+    hint = _wait_for_results_or_terminal_state(driver, timeout=35)
+    if hint == "UNKNOWN" and len(_find_result_cards(driver)) == 0:
+        print(
+            f"[LinkedIn] Timed out waiting for NEU alumni results for company='{company}'. State={hint}"
+        )
+        _dump_linkedin_debug(driver, tag=f"neu_alumni_timeout_{company}")
+        return candidates
+
+    if hint in {"NOT_LOGGED_IN", "BLOCKED_CHECKPOINT"}:
+        print(
+            f"[LinkedIn] NEU alumni search page not usable (state={hint}). Are you logged in and not seeing a checkpoint/captcha?"
+        )
+        _dump_linkedin_debug(driver, tag=f"neu_alumni_blocked_{company}")
+        return candidates
+
+    if location:
+        print("[LinkedIn] Attempting to click filter label: Locations")
+        clicked_locations = _click_linkedin_filter_label(driver, label_text="Locations", timeout=10)
+        print(f"[LinkedIn] Clicked Locations label: {clicked_locations}")
+        if clicked_locations:
+            applied = _apply_linkedin_locations_filter(driver, location=location, timeout=20)
+            print(f"[LinkedIn] Applied location filter '{location}': {applied}")
+            if applied:
+                random_delay("After LinkedIn location filter")
+                hint = _wait_for_results_or_terminal_state(driver, timeout=35)
+
+    print("[LinkedIn] Attempting to click filter label: Current companies")
+    clicked_current_companies = _click_linkedin_filter_label(
+        driver, label_text="Current companies", timeout=10
+    )
+    print(f"[LinkedIn] Clicked Current companies label: {clicked_current_companies}")
+
+    if clicked_current_companies:
+        applied_company = _apply_linkedin_current_companies_filter(driver, company=company, timeout=20)
+        print(f"[LinkedIn] Applied current company filter '{company}': {applied_company}")
+        if applied_company:
+            random_delay("After LinkedIn current company filter")
+            hint = _wait_for_results_or_terminal_state(driver, timeout=35)
+
+    listitems = _find_result_cards(driver)
+    if not listitems:
+        print(
+            f"[LinkedIn] No result cards detected for NEU alumni company='{company}'. State={hint}"
+        )
+        _dump_linkedin_debug(driver, tag=f"neu_alumni_no_cards_{company}")
+        return candidates
+
+    seen_profile_urls: set[str] = set()
+    for item in listitems:
+        if len(candidates) >= MAX_LINKEDIN_RESULTS:
+            break
+
+        try:
+            full_name = _extract_full_name(item)
+        except StaleElementReferenceException:
+            continue
+        except Exception:
+            full_name = ""
+
+        if not full_name or "LinkedIn Member" in full_name:
+            continue
+
+        try:
+            profile_url = _extract_profile_url(item)
+        except StaleElementReferenceException:
+            continue
+        except Exception:
+            profile_url = ""
+
+        if not profile_url:
+            continue
+        if profile_url in seen_profile_urls:
+            continue
+
+        first, last = _parse_name(full_name)
+        if not first:
+            continue
+
+        candidates.append((first, last, profile_url))
+        seen_profile_urls.add(profile_url)
+
+    print(f"[LinkedIn] Found {len(candidates)} NEU alumni candidates for {company}.")
+
+    if len(candidates) == 0:
+        _dump_linkedin_debug(driver, tag=f"neu_alumni_zero_{company}")
 
     return candidates
 
