@@ -9,6 +9,7 @@ from config import (
     ALUMNI_OUTPUT_EXCEL,
     INPUT_EXCEL,
     OUTPUT_EXCEL,
+    PROFILE_CONNECTOR_OUTPUT_EXCEL,
     TECHNICAL_RECRUITER_OUTPUT_EXCEL,
 )
 
@@ -110,4 +111,70 @@ def save_alumni_results(rows: Iterable[Tuple[str, str, str, str, str]]) -> None:
 def save_technical_recruiter_results(rows: Iterable[Tuple[str, str, str, str, str]]) -> None:
     """Append rows to the technical recruiter results file."""
     _save_results(TECHNICAL_RECRUITER_OUTPUT_EXCEL, rows)
+
+
+def load_profile_targets(path: str) -> pd.DataFrame:
+    """
+    Load profile connector targets from an Excel file.
+
+    Expects:
+    - profile_url (required)
+    - note (optional)
+    """
+    path_obj = Path(path)
+    if not path_obj.exists():
+        raise FileNotFoundError(f"Profile input Excel file not found: {path_obj.resolve()}")
+
+    df = pd.read_excel(path_obj)
+    df.columns = [str(c).strip().lower() for c in df.columns]
+
+    if "profile_url" not in set(df.columns):
+        raise ValueError(
+            f"Profile input Excel must contain 'profile_url', found {set(df.columns)}"
+        )
+
+    if "note" not in set(df.columns):
+        df["note"] = ""
+
+    df = df[["profile_url", "note"]].copy()
+    df["profile_url"] = df["profile_url"].astype(str).str.strip()
+    df["note"] = df["note"].fillna("").astype(str)
+    df = df[df["profile_url"] != ""].reset_index(drop=True)
+    return df
+
+
+def _load_existing_profile_results(path: str) -> pd.DataFrame:
+    path_obj = Path(path)
+    if not path_obj.exists():
+        return pd.DataFrame(columns=["profile_url", "note", "outcome"])
+    return pd.read_excel(path_obj)
+
+
+def get_processed_profile_urls(path: str = PROFILE_CONNECTOR_OUTPUT_EXCEL) -> set[str]:
+    """Return profile URLs that already exist in the profile connector results file."""
+    df = _load_existing_profile_results(path)
+    if df.empty:
+        return set()
+
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    if "profile_url" not in set(df.columns):
+        return set()
+
+    urls: set[str] = set()
+    for _, row in df.iterrows():
+        url = str(row.get("profile_url", "")).strip()
+        if url:
+            urls.add(url)
+    return urls
+
+
+def save_profile_connector_results(
+    rows: Iterable[Tuple[str, str, str]],
+    path: str = PROFILE_CONNECTOR_OUTPUT_EXCEL,
+) -> None:
+    """Append profile connector rows to an output Excel file."""
+    new_df = pd.DataFrame(list(rows), columns=["profile_url", "note", "outcome"])
+    existing = _load_existing_profile_results(path)
+    combined = pd.concat([existing, new_df], ignore_index=True) if not existing.empty else new_df
+    combined.to_excel(path, index=False, engine="openpyxl")
 

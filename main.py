@@ -13,12 +13,18 @@ from webdriver_manager.chrome import ChromeDriverManager
 from careershift_scraper import find_email
 from config import (
     ALUMNI_OUTPUT_EXCEL,
+    ENABLE_CONNECT_IN_NORTHEASTERN_ALUMNI_FLOW,
     ENABLE_ENGINEERING_MANAGER_FLOW,
     ENABLE_NORTHEASTERN_ALUMNI_FLOW,
+    ENABLE_PROFILE_CONNECTOR_FLOW,
     ENABLE_TECHNICAL_RECRUITER_FLOW,
     INPUT_EXCEL,
     NORTHEASTERN_SCHOOL_NAME,
     OUTPUT_EXCEL,
+    PROFILE_CONNECTOR_INPUT_EXCEL,
+    PROFILE_CONNECTOR_NOTE,
+    PROFILE_CONNECTOR_OUTPUT_EXCEL,
+    PROFILE_CONNECTOR_URL,
     REMOTE_DEBUGGING_ADDRESS,
     REMOTE_DEBUGGING_PORT,
     SAVE_NORTHEASTERN_ALUMNI_RESULTS,
@@ -29,9 +35,12 @@ from config import (
 from excel_handler import (
     get_processed_alumni_company_location_pairs,
     get_processed_company_location_pairs,
+    get_processed_profile_urls,
     get_processed_technical_recruiter_company_location_pairs,
     load_companies,
+    load_profile_targets,
     save_alumni_results,
+    save_profile_connector_results,
     save_results,
     save_technical_recruiter_results,
 )
@@ -40,6 +49,7 @@ from linkedin_scraper import (
     search_neu_alumni_by_company,
     search_technical_recruiters,
 )
+from linkedin_connector import connect_to_profile
 
 
 def _ensure_site_tab(
@@ -127,6 +137,7 @@ def _process_company(
         flow_name: str,
         lookup_email: bool = True,
         save_enabled: bool = True,
+        connect_enabled: bool = True,
         output_path: str,
         save_row,
     ) -> None:
@@ -141,7 +152,39 @@ def _process_company(
 
         saved_any_row = False
 
-        for idx, (first_name, last_name, _) in enumerate(candidates, start=1):
+        for idx, (first_name, last_name, profile_url_raw) in enumerate(candidates, start=1):
+            profile_url = str(profile_url_raw or "").strip()
+
+            should_connect = bool(
+                ENABLE_CONNECT_IN_NORTHEASTERN_ALUMNI_FLOW
+                and ENABLE_NORTHEASTERN_ALUMNI_FLOW
+                and connect_enabled
+                and profile_url
+            )
+            if should_connect:
+                print(
+                    f"[Info] ({idx}/{len(candidates)}) Connecting via filtered profile: {profile_url}"
+                )
+                try:
+                    _ensure_site_tab(
+                        driver,
+                        attr_name="_linkedin_tab_handle",
+                        domain="linkedin.com",
+                        landing_url="https://www.linkedin.com/feed/",
+                    )
+                    connect_outcome = connect_to_profile(
+                        driver,
+                        profile_url,
+                        PROFILE_CONNECTOR_NOTE,
+                    )
+                    print(
+                        f"[Info] Connect outcome for {first_name} {last_name}: {connect_outcome.name}"
+                    )
+                except Exception:
+                    print(
+                        f"[Error] Failed connect flow for {first_name} {last_name} ({profile_url}).\n{traceback.format_exc()}"
+                    )
+
             if lookup_email:
                 print(
                     f"[Info] ({idx}/{len(candidates)}) Looking up email for {first_name} {last_name} at {company}..."
@@ -216,6 +259,7 @@ def _process_company(
             flow_name="engineering manager candidates",
             lookup_email=True,
             save_enabled=True,
+            connect_enabled=False,
             output_path=OUTPUT_EXCEL,
             save_row=save_results,
         )
@@ -240,6 +284,7 @@ def _process_company(
             flow_name=f"alumni candidates (school={NORTHEASTERN_SCHOOL_NAME})",
             lookup_email=bool(SEARCH_EMAIL_IN_NORTHEASTERN_ALUMNI_FLOW),
             save_enabled=bool(SAVE_NORTHEASTERN_ALUMNI_RESULTS),
+            connect_enabled=True,
             output_path=ALUMNI_OUTPUT_EXCEL,
             save_row=save_alumni_results,
         )
@@ -264,6 +309,7 @@ def _process_company(
             flow_name="technical recruiter candidates",
             lookup_email=True,
             save_enabled=True,
+            connect_enabled=False,
             output_path=TECHNICAL_RECRUITER_OUTPUT_EXCEL,
             save_row=save_technical_recruiter_results,
         )
@@ -297,15 +343,28 @@ def main() -> None:
 
     if ENABLE_TECHNICAL_RECRUITER_FLOW:
         print(f"Recruiter Flow: ENABLED -> {TECHNICAL_RECRUITER_OUTPUT_EXCEL}")
+    if ENABLE_PROFILE_CONNECTOR_FLOW:
+        print(
+            "Profile Connector Flow: ENABLED "
+            f"(single={PROFILE_CONNECTOR_URL}, input={PROFILE_CONNECTOR_INPUT_EXCEL}, output={PROFILE_CONNECTOR_OUTPUT_EXCEL})"
+        )
+    if ENABLE_CONNECT_IN_NORTHEASTERN_ALUMNI_FLOW:
+        print("Connector in Northeastern alumni flow: ENABLED")
 
-    if not Path(INPUT_EXCEL).exists():
+    run_company_flows = bool(
+        ENABLE_ENGINEERING_MANAGER_FLOW
+        or ENABLE_NORTHEASTERN_ALUMNI_FLOW
+        or ENABLE_TECHNICAL_RECRUITER_FLOW
+    )
+
+    if run_company_flows and not Path(INPUT_EXCEL).exists():
         print(
             f"[Error] Input file '{INPUT_EXCEL}' not found. "
             f"Please create it with columns: company, location."
         )
         return
 
-    companies_df = load_companies()
+    companies_df = load_companies() if run_company_flows else None
 
     processed_mgr_pairs = (
         get_processed_company_location_pairs() if ENABLE_ENGINEERING_MANAGER_FLOW else set()
@@ -328,6 +387,16 @@ def main() -> None:
     driver = _init_driver()
 
     try:
+        if ENABLE_PROFILE_CONNECTOR_FLOW:
+            print(
+                "[Skip] Standalone profile connector is disabled by alumni-only policy. "
+                "Connector runs only inside Northeastern alumni flow."
+            )
+
+        if not run_company_flows:
+            print("[Info] Company/location flows are disabled. Nothing else to process.")
+            return
+
         for _, row in companies_df.iterrows():
             company = str(row["company"]).strip()
             location = str(row["location"]).strip()
