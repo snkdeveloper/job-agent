@@ -18,7 +18,9 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 from config import (
     DEBUG_LINKEDIN_DUMPS,
-    MAX_LINKEDIN_RESULTS,
+    MAX_LINKEDIN_RESULTS_ENGINEERING_MANAGER,
+    MAX_LINKEDIN_RESULTS_NORTHEASTERN_ALUMNI,
+    MAX_LINKEDIN_RESULTS_TECHNICAL_RECRUITER,
     NORTHEASTERN_SCHOOL_FILTER,
     random_delay,
 )
@@ -678,7 +680,7 @@ def search_engineering_managers(
 
     seen_profile_urls: set[str] = set()
     for item in listitems:
-        if len(candidates) >= MAX_LINKEDIN_RESULTS:
+        if len(candidates) >= MAX_LINKEDIN_RESULTS_ENGINEERING_MANAGER:
             break
 
         try:
@@ -789,7 +791,7 @@ def search_technical_recruiters(
 
     seen_profile_urls: set[str] = set()
     for item in listitems:
-        if len(candidates) >= MAX_LINKEDIN_RESULTS:
+        if len(candidates) >= MAX_LINKEDIN_RESULTS_TECHNICAL_RECRUITER:
             break
 
         try:
@@ -900,7 +902,7 @@ def search_neu_alumni_by_company(
 
     seen_profile_urls: set[str] = set()
     for item in listitems:
-        if len(candidates) >= MAX_LINKEDIN_RESULTS:
+        if len(candidates) >= MAX_LINKEDIN_RESULTS_NORTHEASTERN_ALUMNI:
             break
 
         try:
