@@ -131,6 +131,14 @@ def _open_matching_contact_details(
 
     Returns True if navigation to a details page was triggered.
     """
+    # Only open details when the card has the explicit contact icon to avoid
+    # spending credits on contacts without available contact details.
+    required_icon_xpath = (
+        ".//a[contains(@class,'contact-icon') "
+        "and @title='View Contact Details for more information' "
+        "and .//span[contains(@class,'fa-envelope-o')]]"
+    )
+
     # Result cards contain links like /App/Contacts/SearchDetails?personId=...
     # Prefer the name link (id starts with contact-title-) to avoid picking controls.
     try:
@@ -158,13 +166,21 @@ def _open_matching_contact_details(
         try:
             name_text = (a.text or a.get_attribute("innerText") or "").strip()
             if _name_matches_result(name_text, first_name, last_name):
-                chosen = a
-                break
+                # Ensure this candidate card includes the required contact icon.
+                card = a.find_element(
+                    By.XPATH,
+                    "ancestor::div[contains(@class,'cs-flex')][1]",
+                )
+                icon_matches = card.find_elements(By.XPATH, required_icon_xpath)
+                if icon_matches:
+                    chosen = a
+                    break
         except Exception:
             continue
 
     if chosen is None:
-        chosen = anchors[0]
+        # Do not open any details page unless the card has the required icon.
+        return False
 
     # Try a robust click.
     href = (chosen.get_attribute("href") or "").strip()
@@ -359,7 +375,12 @@ def find_email(first_name: str, last_name: str, company: str, driver: WebDriver)
                 if not _name_matches_result(name_text, first_name, last_name):
                     continue
 
-                icon = card.find_element(By.CSS_SELECTOR, "a.contact-icon")
+                icon = card.find_element(
+                    By.CSS_SELECTOR,
+                    "a.contact-icon[title='View Contact Details for more information']",
+                )
+                if not icon.find_elements(By.CSS_SELECTOR, "span.fa.fa-envelope-o"):
+                    continue
                 try:
                     driver.execute_script(
                         "arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});",
